@@ -129,6 +129,8 @@ def make_metaworld_env(env_name, idx, capture_video, run_name, max_episode_steps
     def thunk():
         seed = None if base_seed is None else base_seed + idx
         env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
+        # ensure tasks/goals are re-sampled across episodes
+        env.unwrapped._freeze_rand_vec = False
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
@@ -146,6 +148,8 @@ def eval_policy_metaworld(
     seed=0,
 ):
     env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
+    # allow goal / random vector to change across episodes
+    env.unwrapped._freeze_rand_vec = False
     env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
     env = gym.wrappers.ClipAction(env)
 

@@ -27,49 +27,69 @@ def main() -> None:
     if not results_dir.is_dir():
         raise SystemExit(f"Results directory not found: {results_dir}")
 
-    task_means = []
-    task_stds = []
+    task_success_means = []
+    task_success_stds = []
+    task_return_means = []
+    task_return_stds = []
 
     print("Per-task success rates at final evaluation:")
-    print(f"{'task':40s}  {'mean':>8s}  {'std':>8s}  {'n':>3s}")
+    print(f"{'task':40s}  {'succ_mean':>10s}  {'succ_std':>10s}  {'ret_mean':>10s}  {'ret_std':>10s}  {'n':>3s}")
 
     for task in TASKS:
-        rates = []
+        succ_rates = []
+        returns = []
         base_name = task.replace("/", "_")
         for seed in SEEDS:
             file_path = results_dir / f"{base_name}_s{seed}.npz"
             if not file_path.is_file():
                 continue
             data = np.load(file_path, allow_pickle=True)
-            rates.append(float(data["success_rate"]))
+            succ_rates.append(float(data["success_rate"]))
+            returns.append(float(data["mean_return"]))
 
-        if not rates:
-            print(f"{task:40s}  {'NA':>8s}  {'NA':>8s}  {0:3d}")
+        if not succ_rates:
+            print(f"{task:40s}  {'NA':>10s}  {'NA':>10s}  {'NA':>10s}  {'NA':>10s}  {0:3d}")
             continue
 
-        rates_arr = np.asarray(rates, dtype=np.float64)
-        mean = float(rates_arr.mean())
-        std = float(rates_arr.std(ddof=0))
+        succ_arr = np.asarray(succ_rates, dtype=np.float64)
+        ret_arr = np.asarray(returns, dtype=np.float64)
 
-        task_means.append(mean)
-        task_stds.append(std)
+        succ_mean = float(succ_arr.mean())
+        succ_std = float(succ_arr.std(ddof=0))
+        ret_mean = float(ret_arr.mean())
+        ret_std = float(ret_arr.std(ddof=0))
 
-        print(f"{task:40s}  {mean:8.4f}  {std:8.4f}  {len(rates):3d}")
+        task_success_means.append(succ_mean)
+        task_success_stds.append(succ_std)
+        task_return_means.append(ret_mean)
+        task_return_stds.append(ret_std)
 
-    if not task_means:
+        print(
+            f"{task:40s}  "
+            f"{succ_mean:10.4f}  {succ_std:10.4f}  "
+            f"{ret_mean:10.4f}  {ret_std:10.4f}  "
+            f"{len(succ_rates):3d}"
+        )
+
+    if not task_success_means:
         raise SystemExit("No success_rate data found for any task.")
 
-    means_arr = np.asarray(task_means, dtype=np.float64)
-    stds_arr = np.asarray(task_stds, dtype=np.float64)
+    succ_means_arr = np.asarray(task_success_means, dtype=np.float64)
+    succ_stds_arr = np.asarray(task_success_stds, dtype=np.float64)
+    ret_means_arr = np.asarray(task_return_means, dtype=np.float64)
+    ret_stds_arr = np.asarray(task_return_stds, dtype=np.float64)
 
-    overall_mean_of_means = float(means_arr.mean())
-    overall_mean_of_stds = float(stds_arr.mean())
+    overall_succ_mean_of_means = float(succ_means_arr.mean())
+    overall_succ_mean_of_stds = float(succ_stds_arr.mean())
+    overall_ret_mean_of_means = float(ret_means_arr.mean())
+    overall_ret_mean_of_stds = float(ret_stds_arr.mean())
 
     print("\nSummary across 10 tasks:")
-    print(f"mean_of_means_success_rate = {overall_mean_of_means:.4f}")
-    print(f"mean_of_stds_success_rate  = {overall_mean_of_stds:.4f}")
+    print(f"mean_of_means_success_rate = {overall_succ_mean_of_means:.4f}")
+    print(f"mean_of_stds_success_rate  = {overall_succ_mean_of_stds:.4f}")
+    print(f"mean_of_means_return       = {overall_ret_mean_of_means:.4f}")
+    print(f"mean_of_stds_return        = {overall_ret_mean_of_stds:.4f}")
 
 
 if __name__ == "__main__":
     main()
-
