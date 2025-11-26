@@ -154,7 +154,7 @@ if __name__ == "__main__":
             agent = AgentReLU(envs, scale_up_ratio=args.scale_up_ratio, sparsity_level=args.sparsity_level).to(device)
             optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate / np.sqrt(args.scale_up_ratio), eps=1e-5)
 
-        norm_stats = [copy.deepcopy(e.obs_rms) for e in envs.envs]
+        norm_stats = [copy.deepcopy(e.env.env.env.obs_rms) for e in envs.envs]
         init_eval, init_horizon = eval_policy(agent, eval_envs, norm_stats, eval_episodes=10, device=device)
         print("---------------------------------------")
         print(f"T: {0}, Evaluation over {len(init_eval)} episodes. "

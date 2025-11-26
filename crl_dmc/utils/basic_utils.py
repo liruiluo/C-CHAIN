@@ -1,4 +1,5 @@
 import gymnasium as gym
+import shimmy  # noqa: F401  # ensure dm_control/* envs are registered
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,7 +12,9 @@ def eval_policy(eval_agent, eval_env, norm_stats, eval_episodes=10, device=None)
     if norm_stats is not None:
         for e, s in zip(eval_env.envs, norm_stats):
             # NOTE - important, to make stats assignment take effect really
-            # e.obs_rms = s
+            # wrapper order (outer -> inner):
+            # TransformReward -> NormalizeReward -> TransformObservation -> NormalizeObservation -> ...
+            # so NormalizeObservation is at e.env.env.env
             e.env.env.env.obs_rms = s
 
     episode_returns, episode_lengths = [], []
@@ -39,10 +42,16 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(
+            env,
+            lambda obs: np.clip(obs, -10, 10),
+            env.observation_space,
+        )
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
+
+    return thunk
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
