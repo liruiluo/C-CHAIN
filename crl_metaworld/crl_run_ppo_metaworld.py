@@ -16,8 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 import copy
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
+def layer_init(layer, bias_const: float = 0.0):
+    # Match Flax Dense (LeCun normal) used by sbx PPO: fan_in, gain=1.
+    torch.nn.init.kaiming_normal_(layer.weight, mode="fan_in", nonlinearity="linear")
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
@@ -42,7 +43,7 @@ class AgentReLU(nn.Module):
                 nn.ReLU(),
                 layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
                 nn.ReLU(),
-                layer_init(nn.Linear(self.hidden_dim, 1), std=1.0),
+                layer_init(nn.Linear(self.hidden_dim, 1)),
             )
             self.actor_mean = nn.Sequential(
                 layer_init(nn.Linear(obs_dim, self.hidden_dim)),
@@ -51,7 +52,7 @@ class AgentReLU(nn.Module):
                 nn.ReLU(),
                 layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
                 nn.ReLU(),
-                layer_init(nn.Linear(self.hidden_dim, act_dim), std=0.01),
+                layer_init(nn.Linear(self.hidden_dim, act_dim)),
             )
         else:
             self.critic = nn.Sequential(
@@ -62,7 +63,7 @@ class AgentReLU(nn.Module):
                 layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
                 nn.ReLU(),
                 nn.LayerNorm(self.hidden_dim, elementwise_affine=False),
-                layer_init(nn.Linear(self.hidden_dim, 1), std=1.0),
+                layer_init(nn.Linear(self.hidden_dim, 1)),
             )
             self.actor_mean = nn.Sequential(
                 layer_init(nn.Linear(obs_dim, self.hidden_dim)),
@@ -135,7 +136,6 @@ def make_metaworld_env(env_name, idx, capture_video, run_name, max_episode_steps
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
         return env
 
     return thunk
@@ -232,8 +232,8 @@ class Args:
     """normalize advantages"""
     clip_coef: float = 0.2
     """PPO clip coefficient"""
-    clip_vloss: bool = True
-    """use value clipping"""
+    clip_vloss: bool = False
+    """use value clipping (disabled to match sbx PPO)"""
     ent_coef: float = 0.0
     """entropy coefficient"""
     vf_coef: float = 0.5
@@ -316,7 +316,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(
         agent.parameters(),
         lr=args.learning_rate / np.sqrt(args.scale_up_ratio),
-        eps=1e-5,
+        eps=1e-8,  # align with optax.adam default used in sbx PPO
     )
 
     init_eval, init_horizon, init_success = eval_policy_metaworld(
@@ -357,7 +357,7 @@ if __name__ == "__main__":
 
     for iteration in range(1, args.num_iterations + 1):
         if args.anneal_lr:
-            progress = (iteration - 1.0) / max(args.num_iterations - 1.0, 1.0)
+            progress = min(global_step / max(args.total_timesteps, 1), 1.0)
             base_lr_now = args.learning_rate + progress * (
                 args.final_learning_rate - args.learning_rate
             )
@@ -378,11 +378,39 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
-            next_obs_np, reward, terminations, truncations, infos = envs.step(
-                action.cpu().numpy()
+            # Align with sbx PPO: clip actions right before env.step (no ClipAction wrapper).
+            action_np = action.cpu().numpy()
+            action_np = np.clip(
+                action_np, envs.single_action_space.low, envs.single_action_space.high
             )
+            next_obs_np, reward, terminations, truncations, infos = envs.step(action_np)
             next_done_np = np.logical_or(terminations, truncations)
-            rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device)
+            reward_adj = np.array(reward, copy=True)
+            if "final_info" in infos:
+                for env_idx, info in enumerate(infos["final_info"]):
+                    if (
+                        info
+                        and truncations[env_idx]
+                        and not terminations[env_idx]
+                    ):
+                        term_obs = (
+                            info.get("terminal_observation")
+                            or info.get("final_observation")
+                            or info.get("observation")
+                        )
+                        if term_obs is not None:
+                            term_obs_t = torch.as_tensor(
+                                term_obs, dtype=torch.float32, device=device
+                            )
+                            if term_obs_t.ndim == 1:
+                                term_obs_t = term_obs_t.unsqueeze(0)
+                            with torch.no_grad():
+                                bootstrap_v = agent.get_value(term_obs_t).flatten()
+                            reward_adj[env_idx] += args.gamma * float(
+                                bootstrap_v.item()
+                            )
+
+            rewards[step] = torch.as_tensor(reward_adj, dtype=torch.float32, device=device)
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
@@ -500,9 +528,9 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
+                    v_loss = v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
