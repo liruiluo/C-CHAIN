@@ -594,3 +594,25 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    # Final evaluation & save results (align with C-CHAIN script)
+    final_returns, final_horizon, final_success = eval_policy_metaworld(
+        agent,
+        eval_env_name,
+        eval_episodes=10,
+        device=device,
+        max_episode_steps=args.max_episode_steps,
+        seed=args.seed + 9999,
+    )
+    os.makedirs("results/metaworld_ppo", exist_ok=True)
+    save_path = os.path.join(
+        "results/metaworld_ppo",
+        f"{args.env_name.replace('/', '_')}_s{args.seed}.npz",
+    )
+    np.savez_compressed(
+        save_path,
+        success_rate=final_success,
+        mean_return=float(np.mean(final_returns)),
+        mean_horizon=float(np.mean(final_horizon)),
+        config=vars(args),
+    )
