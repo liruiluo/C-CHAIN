@@ -127,6 +127,15 @@ class AgentReLU(nn.Module):
 
 
 def make_metaworld_env(env_name, idx, capture_video, run_name, max_episode_steps, base_seed):
+    class TerminalObsWrapper(gym.Wrapper):
+        """Ensure terminal observation is always in info for truncated/terminated steps."""
+
+        def step(self, action):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            if terminated or truncated:
+                info["terminal_observation"] = obs
+            return obs, reward, terminated, truncated, info
+
     def thunk():
         seed = None if base_seed is None else base_seed + idx
         env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
@@ -134,6 +143,7 @@ def make_metaworld_env(env_name, idx, capture_video, run_name, max_episode_steps
         env.unwrapped._freeze_rand_vec = False
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = TerminalObsWrapper(env)
         return env
 
     return thunk
@@ -390,29 +400,38 @@ if __name__ == "__main__":
             next_obs_np, reward, terminations, truncations, infos = envs.step(action_np)
             next_done_np = np.logical_or(terminations, truncations)
             reward_adj = np.array(reward, copy=True)
-            if "final_info" in infos:
-                for env_idx, info in enumerate(infos["final_info"]):
-                    if (
-                        info
-                        and truncations[env_idx]
-                        and not terminations[env_idx]
-                    ):
+            term_obs_batch = infos.get("terminal_observation")
+            final_info = infos.get("final_info")
+            final_obs = infos.get("final_observation")
+            for env_idx in range(args.num_envs):
+                if truncations[env_idx] and not terminations[env_idx]:
+                    term_obs = None
+                    if term_obs_batch is not None:
+                        term_obs = term_obs_batch[env_idx]
+                    if term_obs is None and final_info and final_info[env_idx]:
                         term_obs = (
-                            info.get("terminal_observation")
-                            or info.get("final_observation")
-                            or info.get("observation")
+                            final_info[env_idx].get("terminal_observation")
+                            or final_info[env_idx].get("final_observation")
+                            or final_info[env_idx].get("observation")
                         )
-                        if term_obs is not None:
-                            term_obs_t = torch.as_tensor(
-                                term_obs, dtype=torch.float32, device=device
-                            )
-                            if term_obs_t.ndim == 1:
-                                term_obs_t = term_obs_t.unsqueeze(0)
-                            with torch.no_grad():
-                                bootstrap_v = agent.get_value(term_obs_t).flatten()
-                            reward_adj[env_idx] += args.gamma * float(
-                                bootstrap_v.item()
-                            )
+                    if term_obs is None and final_obs is not None:
+                        term_obs = final_obs[env_idx]
+                    if term_obs is None:
+                        raise RuntimeError(
+                            "TimeLimit truncation without terminal observation; "
+                            "expected terminal_observation/final_observation in info."
+                        )
+                    if term_obs is not None:
+                        term_obs_t = torch.as_tensor(
+                            term_obs, dtype=torch.float32, device=device
+                        )
+                        if term_obs_t.ndim == 1:
+                            term_obs_t = term_obs_t.unsqueeze(0)
+                        with torch.no_grad():
+                            bootstrap_v = agent.get_value(term_obs_t).flatten()
+                        reward_adj[env_idx] += args.gamma * float(
+                            bootstrap_v.item()
+                        )
 
             rewards[step] = torch.as_tensor(reward_adj, dtype=torch.float32, device=device)
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
