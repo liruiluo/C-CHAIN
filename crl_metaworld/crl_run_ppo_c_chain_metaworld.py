@@ -192,7 +192,7 @@ class Args:
     """Metaworld env_name, e.g. hammer-v3-goal-observable"""
     total_timesteps: int = 1_000_000
     """total timesteps of the experiment"""
-    eval_freq_timesteps: int = 50_000
+    eval_freq_timesteps: int = 100_000
     """timestep interval to evaluate the policy"""
     seed: int = 1
     """random seed"""
@@ -211,7 +211,7 @@ class Args:
 
     learning_rate: float = 3e-4
     """Adam learning rate"""
-    num_envs: int = 1
+    num_envs: int = 8
     """number of parallel environments"""
     num_steps: int = 2048
     """steps per rollout in each env"""
@@ -221,7 +221,7 @@ class Args:
     """discount factor"""
     gae_lambda: float = 0.95
     """lambda for GAE"""
-    num_minibatches: int = 32
+    num_minibatches: int = 64
     """number of minibatches"""
     update_epochs: int = 10
     """number of epochs per update"""
@@ -261,7 +261,7 @@ if __name__ == "__main__":
         os.environ["WANDB_MODE"] = "offline"
         wandb.init(
             name=run_name,
-            project="metaworld_cchain",
+            project="ppo_experiments",
             sync_tensorboard=True,
             config=vars(args),
             monitor_gym=True,
