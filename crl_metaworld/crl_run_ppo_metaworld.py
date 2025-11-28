@@ -146,7 +146,7 @@ def eval_policy_metaworld(
     env_name,
     eval_episodes=10,
     device=None,
-    max_episode_steps=200,
+    max_episode_steps=500,
     seed=0,
 ):
     env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
@@ -211,13 +211,15 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     learning_rate: float = 3e-4
-    """Adam learning rate"""
+    """initial Adam learning rate"""
+    final_learning_rate: float = 1e-4
+    """final Adam learning rate for linear schedule"""
     num_envs: int = 8
     """number of parallel environments"""
     num_steps: int = 2048
     """steps per rollout in each env"""
-    anneal_lr: bool = False
-    """toggle learning rate annealing"""
+    anneal_lr: bool = True
+    """toggle learning rate annealing (linear from learning_rate to final_learning_rate)"""
     gamma: float = 0.99
     """discount factor"""
     gae_lambda: float = 0.95
@@ -355,11 +357,13 @@ if __name__ == "__main__":
 
     for iteration in range(1, args.num_iterations + 1):
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate / np.sqrt(args.scale_up_ratio)
+            progress = (iteration - 1.0) / max(args.num_iterations - 1.0, 1.0)
+            base_lr_now = args.learning_rate + progress * (
+                args.final_learning_rate - args.learning_rate
+            )
+            lrnow = base_lr_now / np.sqrt(args.scale_up_ratio)
             optimizer.param_groups[0]["lr"] = lrnow
-        else:
-            frac = 1.0
+        # no need for frac here; kept for similarity with C-CHAIN
 
         # Rollout
         for step in range(args.num_steps):
@@ -543,4 +547,3 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
-
