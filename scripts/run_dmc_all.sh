@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run DMC continual RL experiments for the ICML C-CHAIN paper:
-# - Baseline PPO (shared agent across tasks)
-# - C-CHAIN PPO
-# - Oracle PPO (reset agent per task)
-#
-# Each env_id (dog, walker, quadruped) is run for multiple seeds.
-# Uses uv to run inside the project virtual environment.
+# Run only C-CHAIN PPO on DMC continual tasks.
 #
 # Usage:
 #   TOTAL_STEPS=1000000 GPU_NO=0 bash scripts/run_dmc_all.sh
@@ -27,26 +21,11 @@ SEEDS=(1 2 3 4 5)
 
 for env_id in "${ENV_IDS[@]}"; do
   for seed in "${SEEDS[@]}"; do
-    echo "=== BASELINE PPO | env_id=${env_id} | seed=${seed} | total_steps=${TOTAL_STEPS} ==="
-    uv run python crl_dmc/crl_run_ppo_dmc.py \
-      --env_id "${env_id}" \
-      --seed "${seed}" \
-      --total_timesteps "${TOTAL_STEPS}" \
-      --gpu_no "${GPU_NO}"
-
     echo "=== C-CHAIN PPO | env_id=${env_id} | seed=${seed} | total_steps=${TOTAL_STEPS} ==="
     uv run python crl_dmc/crl_run_ppo_c_chain_dmc.py \
       --env_id "${env_id}" \
       --seed "${seed}" \
       --total_timesteps "${TOTAL_STEPS}" \
       --gpu_no "${GPU_NO}"
-
-    echo "=== ORACLE PPO | env_id=${env_id} | seed=${seed} | total_steps=${TOTAL_STEPS} ==="
-    uv run python crl_dmc/crl_run_ppo_dmc_oracle.py \
-      --env_id "${env_id}" \
-      --seed "${seed}" \
-      --total_timesteps "${TOTAL_STEPS}" \
-      --gpu_no "${GPU_NO}"
   done
 done
-
