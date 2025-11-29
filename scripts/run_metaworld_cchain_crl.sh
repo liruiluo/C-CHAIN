@@ -30,13 +30,10 @@ if [[ -n "${TASKS:-}" ]]; then
 else
   TASKS_ARR=("${TASKS_DEFAULT[@]}")
 fi
-# Tyro expects a list literal; join with commas, no spaces.
-IFS=','; TASKS_ARG="[${TASKS_ARR[*]}]"; unset IFS
-
 for seed in "${SEEDS[@]}"; do
   echo "=== Continual chain, seed ${seed}, total_steps_per_task=${TOTAL_STEPS} ==="
   uv run python crl_metaworld/crl_run_ppo_c_chain_metaworld_crl.py \
-    --tasks "${TASKS_ARG}" \
+    --tasks "${TASKS_ARR[@]}" \
     --total_timesteps "${TOTAL_STEPS}" \
     --seed "${seed}" \
     --gpu_no "${GPU_NO}"
