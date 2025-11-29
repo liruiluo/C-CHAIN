@@ -104,13 +104,16 @@ class AgentReLU(nn.Module):
     def get_value(self, x):
         return self.critic(x)
 
-    def select_action(self, obs):
+    def select_action(self, obs, deterministic: bool = False):
         with torch.no_grad():
             action_mean = self.actor_mean(obs)
             action_logstd = self.actor_logstd.expand_as(action_mean)
             action_std = torch.exp(action_logstd)
             probs = Normal(action_mean, action_std)
-            action = probs.sample()
+            if deterministic:
+                action = action_mean
+            else:
+                action = probs.sample()
         return action.cpu().numpy()
 
     def get_action_and_value(self, x, action=None):
@@ -173,7 +176,8 @@ def eval_policy_metaworld(
         success_flag = False
         while not done:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            action = eval_agent.select_action(obs_t)[0]
+            # Use stochastic action during eval (matches earlier behavior and avoids over-penalizing noisy policies).
+            action = eval_agent.select_action(obs_t, deterministic=False)[0]
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             if "success" in info and float(info["success"]) == 1.0:
@@ -461,7 +465,8 @@ if __name__ == "__main__":
             print("---------------------------------------")
             print(
                 f"T: {global_step}, life_step={life_step}, Evaluation over {len(cur_eval)} episodes. "
-                f"Scores: {np.mean(cur_eval):.3f}, Horizons: {np.mean(cur_horizon):.3f}"
+                f"Scores: {np.mean(cur_eval):.3f} ± {np.std(cur_eval):.3f}, "
+                f"Horizons: {np.mean(cur_horizon):.3f} ± {np.std(cur_horizon):.3f}"
             )
             print("---------------------------------------")
             writer.add_scalar("charts/Eval", np.mean(cur_eval), eval_cnt)
