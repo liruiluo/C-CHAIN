@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 import gymnasium as gym
+import metaworld  # noqa: F401  # register Meta-World envs
 import numpy as np
 import torch
 import torch.nn as nn
