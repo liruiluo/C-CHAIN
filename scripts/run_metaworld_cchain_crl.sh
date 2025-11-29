@@ -30,8 +30,8 @@ if [[ -n "${TASKS:-}" ]]; then
 else
   TASKS_ARR=("${TASKS_DEFAULT[@]}")
 fi
-
-TASKS_ARG="[${TASKS_ARR[*]}]"
+# Tyro expects a list literal; join with commas, no spaces.
+IFS=','; TASKS_ARG="[${TASKS_ARR[*]}]"; unset IFS
 
 for seed in "${SEEDS[@]}"; do
   echo "=== Continual chain, seed ${seed}, total_steps_per_task=${TOTAL_STEPS} ==="
