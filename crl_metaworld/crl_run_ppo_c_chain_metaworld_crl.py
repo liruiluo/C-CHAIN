@@ -1,0 +1,636 @@
+import os
+import random
+import time
+from dataclasses import dataclass, field
+from typing import List
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import tyro
+from torch.distributions.normal import Normal
+from torch.utils.tensorboard import SummaryWriter
+
+import copy
+
+
+def layer_init(layer, bias_const: float = 0.0):
+    torch.nn.init.kaiming_normal_(layer.weight, mode="fan_in", nonlinearity="linear")
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class AgentReLU(nn.Module):
+    def __init__(self, envs, scale_up_ratio=1, sparsity_level=0, post_LN=False):
+        super().__init__()
+        self.scale_up_ratio = scale_up_ratio
+        self.sparsity_level = sparsity_level
+        self.post_LN = post_LN
+
+        self.hidden_dim = 256 * scale_up_ratio
+
+        obs_dim = int(np.prod(envs.single_observation_space.shape))
+        act_dim = int(np.prod(envs.single_action_space.shape))
+
+        if not self.post_LN:
+            self.critic = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, 1)),
+            )
+            self.actor_mean = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, act_dim)),
+            )
+        else:
+            self.critic = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                nn.LayerNorm(self.hidden_dim, elementwise_affine=False),
+                layer_init(nn.Linear(self.hidden_dim, 1)),
+            )
+            self.actor_mean = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                nn.ReLU(),
+                nn.LayerNorm(self.hidden_dim, elementwise_affine=False),
+                layer_init(nn.Linear(self.hidden_dim, act_dim), std=0.01),
+            )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
+
+        self.sparse_init()
+
+    def sparse_init(self):
+        for param in self.actor_mean.parameters():
+            if param.ndim == 1:
+                continue
+            sparsity_mask = np.random.choice(
+                [0, 1],
+                size=param.shape,
+                p=[self.sparsity_level, 1 - self.sparsity_level],
+            )
+            sparsity_mask = torch.as_tensor(sparsity_mask, dtype=param.dtype)
+            param.data.mul_(sparsity_mask)
+        for param in self.critic.parameters():
+            if param.ndim == 1:
+                continue
+            sparsity_mask = np.random.choice(
+                [0, 1],
+                size=param.shape,
+                p=[self.sparsity_level, 1 - self.sparsity_level],
+            )
+            sparsity_mask = torch.as_tensor(sparsity_mask, dtype=param.dtype)
+            param.data.mul_(sparsity_mask)
+
+    def get_value(self, x):
+        return self.critic(x)
+
+    def select_action(self, obs, deterministic: bool = False):
+        with torch.no_grad():
+            action_mean = self.actor_mean(obs)
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+            action_std = torch.exp(action_logstd)
+            probs = Normal(action_mean, action_std)
+            if deterministic:
+                action = action_mean
+            else:
+                action = probs.sample()
+        return action.cpu().numpy()
+
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        if action is None:
+            action = probs.sample()
+        log_prob = probs.log_prob(action).sum(1)
+        entropy = probs.entropy().sum(1)
+        value = self.critic(x)
+        return action, log_prob, entropy, value
+
+
+def make_metaworld_env(env_name, idx, capture_video, run_name, max_episode_steps, base_seed):
+    class TerminalObsWrapper(gym.Wrapper):
+        """Ensure terminal observation is always in info for truncated/terminated steps."""
+
+        def step(self, action):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            if terminated or truncated:
+                info["terminal_observation"] = obs
+            return obs, reward, terminated, truncated, info
+
+    def thunk():
+        seed = None if base_seed is None else base_seed + idx
+        env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
+        env.unwrapped._freeze_rand_vec = False
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = TerminalObsWrapper(env)
+        return env
+
+    return thunk
+
+
+def eval_policy_metaworld(
+    eval_agent,
+    env_name,
+    eval_episodes=10,
+    device=None,
+    max_episode_steps=500,
+    seed=0,
+):
+    env = gym.make("Meta-World/goal_observable", env_name=env_name, seed=seed)
+    env.unwrapped._freeze_rand_vec = False
+    env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+    env = gym.wrappers.ClipAction(env)
+
+    episode_returns, episode_lengths = [], []
+    success_count = 0
+    for _ in range(eval_episodes):
+        obs, info = env.reset()
+        done = False
+        total_r = 0.0
+        steps = 0
+        success_flag = False
+        while not done:
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            action = eval_agent.select_action(obs_t, deterministic=False)[0]
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = bool(terminated or truncated)
+            if "success" in info and float(info["success"]) == 1.0:
+                success_flag = True
+            total_r += float(reward)
+            steps += 1
+        episode_returns.append(total_r)
+        episode_lengths.append(steps)
+        if success_flag:
+            success_count += 1
+
+    env.close()
+    success_rate = success_count / float(eval_episodes)
+    return episode_returns, episode_lengths, success_rate
+
+
+DEFAULT_TASKS = [
+    "hammer-v3-goal-observable",
+    "push-wall-v3-goal-observable",
+    "faucet-close-v3-goal-observable",
+    "push-back-v3-goal-observable",
+    "stick-pull-v3-goal-observable",
+    "handle-press-side-v3-goal-observable",
+    "push-v3-goal-observable",
+    "shelf-place-v3-goal-observable",
+    "window-close-v3-goal-observable",
+    "peg-unplug-side-v3-goal-observable",
+]
+
+
+@dataclass
+class Args:
+    scale_up_ratio: int = 1
+    sparsity_level: float = 0.0
+    target_rel_loss_scale: float = 0.05
+
+    alg: str = "ppo_relu_cchain_metaworld_chain"
+    tasks: List[str] = field(default_factory=lambda: DEFAULT_TASKS)
+    total_timesteps: int = 1_000_000  # per task
+    eval_freq_timesteps: int = 100_000
+    seed: int = 1
+
+    gpu_no: str = "0"
+    use_cluster: bool = False
+    track: bool = False
+
+    capture_video: bool = False
+    save_model: bool = False
+
+    learning_rate: float = 3e-4
+    final_learning_rate: float = 1e-4
+    num_envs: int = 8
+    num_steps: int = 2048
+    anneal_lr: bool = True
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    num_minibatches: int = 64
+    update_epochs: int = 10
+    norm_adv: bool = True
+    clip_coef: float = 0.2
+    clip_vloss: bool = False
+    ent_coef: float = 0.0
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    target_kl: float | None = None
+    max_episode_steps: int = 500
+
+    batch_size: int = 0
+    minibatch_size: int = 0
+    num_iterations: int = 0
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+
+    run_name = f"{args.alg}__chain__{len(args.tasks)}tasks__seed{args.seed}__{int(time.time())}"
+    if args.track:
+        import wandb
+
+        os.environ["WANDB_MODE"] = "offline"
+        wandb.init(
+            name=run_name,
+            project="ppo_experiments",
+            sync_tensorboard=True,
+            config=vars(args),
+            monitor_gym=True,
+            save_code=True,
+        )
+
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+
+    if not args.use_cluster:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_no
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this script (no CPU fallback).")
+    device = torch.device("cuda")
+
+    agent = None
+    optimizer = None
+    global_step = 0
+    life_step = 0
+
+    for task_idx, env_name in enumerate(args.tasks):
+        print("=======================================")
+        print(f"[Task {task_idx + 1}/{len(args.tasks)}] {env_name}")
+        envs = gym.vector.SyncVectorEnv(
+            [
+                make_metaworld_env(
+                    env_name,
+                    i,
+                    args.capture_video,
+                    run_name,
+                    args.max_episode_steps,
+                    args.seed,
+                )
+                for i in range(args.num_envs)
+            ]
+        )
+        next_obs, _ = envs.reset(seed=args.seed)
+        next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+        next_done = torch.zeros(args.num_envs, device=device)
+
+        if agent is None:
+            agent = AgentReLU(envs, scale_up_ratio=args.scale_up_ratio, sparsity_level=args.sparsity_level).to(device)
+            optimizer = optim.Adam(
+                agent.parameters(),
+                lr=args.learning_rate / np.sqrt(args.scale_up_ratio),
+                eps=1e-8,
+            )
+        else:
+            # 简单形状检查，确保跨任务复用同一网络安全。
+            assert (
+                agent.actor_mean[0].in_features == np.prod(envs.single_observation_space.shape)
+            ), "Observation shape changed across tasks."
+            assert (
+                agent.actor_mean[-1].out_features == np.prod(envs.single_action_space.shape)
+            ), "Action shape changed across tasks."
+
+        init_eval, init_horizon, init_success = eval_policy_metaworld(
+            agent,
+            env_name,
+            eval_episodes=10,
+            device=device,
+            max_episode_steps=args.max_episode_steps,
+            seed=args.seed,
+        )
+        print(
+            f"T: {global_step}, Evaluation over {len(init_eval)} episodes. "
+            f"Scores: {np.mean(init_eval):.3f}, Horizons: {np.mean(init_horizon):.3f}"
+        )
+        writer.add_scalar("charts/Eval", np.mean(init_eval), global_step)
+        writer.add_scalar("charts/Eval_Horizon", np.mean(init_horizon), global_step)
+        writer.add_scalar("charts/SuccessRate", init_success, global_step)
+
+        his_agent_list = [copy.deepcopy(agent)]
+        running_p_loss_list, running_reg_loss_list = [], []
+        cur_reg_coef = 100.0
+
+        obs = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
+            device=device,
+        )
+        actions = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device
+        )
+        logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
+        rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
+        dones = torch.zeros((args.num_steps, args.num_envs), device=device)
+        values = torch.zeros((args.num_steps, args.num_envs), device=device)
+
+        start_time = time.time()
+        eval_cnt = 0
+
+        for iteration in range(1, args.num_iterations + 1):
+            if args.anneal_lr:
+                progress = min(global_step / max(args.total_timesteps * len(args.tasks), 1), 1.0)
+                base_lr_now = args.learning_rate + progress * (
+                    args.final_learning_rate - args.learning_rate
+                )
+                lrnow = base_lr_now / np.sqrt(args.scale_up_ratio)
+                optimizer.param_groups[0]["lr"] = lrnow
+                frac = base_lr_now / args.learning_rate if args.learning_rate > 0 else 1.0
+            else:
+                frac = 1.0
+
+            for step in range(args.num_steps):
+                global_step += args.num_envs
+                life_step += args.num_envs
+                obs[step] = next_obs
+                dones[step] = next_done
+
+                with torch.no_grad():
+                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    values[step] = value.flatten()
+                actions[step] = action
+                logprobs[step] = logprob
+
+                action_np = action.cpu().numpy()
+                action_np = np.clip(
+                    action_np, envs.single_action_space.low, envs.single_action_space.high
+                )
+                next_obs_np, reward, terminations, truncations, infos = envs.step(action_np)
+                next_done_np = np.logical_or(terminations, truncations)
+                reward_adj = np.array(reward, copy=True)
+                term_obs_batch = infos.get("terminal_observation")
+                final_info = infos.get("final_info")
+                final_obs = infos.get("final_observation")
+                for env_idx in range(args.num_envs):
+                    if truncations[env_idx] and not terminations[env_idx]:
+                        term_obs = None
+                        if term_obs_batch is not None:
+                            term_obs = term_obs_batch[env_idx]
+                        if term_obs is None and final_info and final_info[env_idx]:
+                            term_obs = (
+                                final_info[env_idx].get("terminal_observation")
+                                or final_info[env_idx].get("final_observation")
+                                or final_info[env_idx].get("observation")
+                            )
+                        if term_obs is None and final_obs is not None:
+                            term_obs = final_obs[env_idx]
+                        if term_obs is None:
+                            raise RuntimeError(
+                                "TimeLimit truncation without terminal observation; "
+                                "expected terminal_observation/final_observation in info."
+                            )
+                        if term_obs is not None:
+                            term_obs_t = torch.as_tensor(
+                                term_obs, dtype=torch.float32, device=device
+                            )
+                            if term_obs_t.ndim == 1:
+                                term_obs_t = term_obs_t.unsqueeze(0)
+                            with torch.no_grad():
+                                bootstrap_v = agent.get_value(term_obs_t).flatten()
+                            reward_adj[env_idx] += args.gamma * float(
+                                bootstrap_v.item()
+                            )
+
+                rewards[step] = torch.as_tensor(reward_adj, dtype=torch.float32, device=device)
+                next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+                next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
+
+                if "final_info" in infos:
+                    for info in infos["final_info"]:
+                        if info and "episode" in info:
+                            ret = info["episode"]["r"]
+                            length = info["episode"]["l"]
+                            writer.add_scalar("charts/episodic_return", ret, life_step)
+                            writer.add_scalar("charts/episodic_length", length, life_step)
+
+            if (global_step // args.eval_freq_timesteps) > eval_cnt:
+                eval_cnt += 1
+                cur_eval, cur_horizon, cur_success = eval_policy_metaworld(
+                    agent,
+                    env_name,
+                    eval_episodes=10,
+                    device=device,
+                    max_episode_steps=args.max_episode_steps,
+                    seed=args.seed + eval_cnt,
+                )
+                print(
+                    f"T: {global_step}, life_step={life_step}, Evaluation over {len(cur_eval)} episodes. "
+                    f"Scores: {np.mean(cur_eval):.3f} ± {np.std(cur_eval):.3f}, "
+                    f"Horizons: {np.mean(cur_horizon):.3f} ± {np.std(cur_horizon):.3f}"
+                )
+                writer.add_scalar("charts/Eval", np.mean(cur_eval), eval_cnt + task_idx * 1000)
+                writer.add_scalar("charts/Eval_Horizon", np.mean(cur_horizon), eval_cnt + task_idx * 1000)
+                writer.add_scalar("charts/SuccessRate", cur_success, eval_cnt + task_idx * 1000)
+
+            with torch.no_grad():
+                next_value = agent.get_value(next_obs).reshape(1, -1)
+                advantages = torch.zeros_like(rewards, device=device)
+                lastgaelam = 0.0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                    advantages[t] = lastgaelam = (
+                        delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    )
+                returns = advantages + values
+
+            b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+            b_logprobs = logprobs.reshape(-1)
+            b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+            b_advantages = advantages.reshape(-1)
+            b_returns = returns.reshape(-1)
+            b_values = values.reshape(-1)
+
+            b_inds = np.arange(args.batch_size)
+            b_ref_inds = np.arange(args.batch_size)
+            b_reg_inds = np.arange(args.batch_size)
+            clipfracs = []
+
+            for epoch in range(args.update_epochs):
+                np.random.shuffle(b_inds)
+                np.random.shuffle(b_ref_inds)
+                np.random.shuffle(b_reg_inds)
+                for start in range(0, args.batch_size, args.minibatch_size):
+                    end = start + args.minibatch_size
+                    mb_inds = b_inds[start:end]
+                    mb_ref_inds = b_ref_inds[start:end]
+                    mb_reg_inds = b_reg_inds[start:end]
+
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                        b_obs[mb_inds], b_actions[mb_inds]
+                    )
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
+
+                    with torch.no_grad():
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clipfracs.append(
+                            ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                        )
+
+                    mb_advantages = b_advantages[mb_inds]
+                    if args.norm_adv:
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                            mb_advantages.std() + 1e-8
+                        )
+
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    newvalue = newvalue.view(-1)
+                    if args.clip_vloss:
+                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        v_clipped = b_values[mb_inds] + torch.clamp(
+                            newvalue - b_values[mb_inds],
+                            -args.clip_coef,
+                            args.clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = v_loss_max.mean()
+                    else:
+                        v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                    if len(his_agent_list) <= 2:
+                        reg_loss = 0.0
+                    else:
+                        reg_agent = his_agent_list[-2]
+                        cur_action_means = agent.actor_mean(b_obs[mb_reg_inds])
+                        with torch.no_grad():
+                            reg_action_means = reg_agent.actor_mean(b_obs[mb_reg_inds])
+                        reg_loss = ((cur_action_means - reg_action_means) ** 2).mean()
+
+                    loss = loss + cur_reg_coef * reg_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
+                    his_agent_list.append(copy.deepcopy(agent))
+                    his_agent_list = his_agent_list[-10:]
+
+                if args.target_kl is not None and approx_kl > args.target_kl:
+                    break
+
+            ref_agent = his_agent_list[-2]
+            with torch.no_grad():
+                cur_ref_action_means = agent.actor_mean(b_obs[mb_ref_inds])
+                ref_action_means = ref_agent.actor_mean(b_obs[mb_ref_inds])
+            policy_churn = ((cur_ref_action_means - ref_action_means) ** 2).mean()
+
+            y_pred = b_values.cpu().numpy()
+            y_true = b_returns.cpu().numpy()
+            var_y = np.var(y_true)
+            explained_var = (
+                np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+            )
+
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], life_step)
+            writer.add_scalar("charts/policy_churn", policy_churn.item(), life_step)
+            writer.add_scalar("losses/value_loss", v_loss.item(), life_step)
+            writer.add_scalar("losses/policy_loss", pg_loss.item(), life_step)
+            writer.add_scalar("losses/entropy", entropy_loss.item(), life_step)
+            writer.add_scalar(
+                "losses/reg_loss", float(reg_loss) if isinstance(reg_loss, float) else reg_loss.item(), life_step
+            )
+            writer.add_scalar("charts/auto_coef", cur_reg_coef, life_step)
+            writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), life_step)
+            writer.add_scalar("losses/approx_kl", approx_kl.item(), life_step)
+            writer.add_scalar("losses/clipfrac", np.mean(clipfracs), life_step)
+            writer.add_scalar("losses/explained_variance", explained_var, life_step)
+            sps = int(life_step / (time.time() - start_time))
+            writer.add_scalar("charts/SPS", sps, life_step)
+
+            running_p_loss_list.append(pg_loss.item())
+            running_reg_loss_list.append(
+                0.0 if isinstance(reg_loss, float) else reg_loss.item()
+            )
+            if iteration >= 50:
+                running_p_loss = np.mean(np.abs(running_p_loss_list[-100:]))
+                running_reg_loss = np.mean(running_reg_loss_list[-100:])
+                cur_reg_coef = (
+                    args.target_rel_loss_scale
+                    * running_p_loss
+                    / (running_reg_loss + 1e-8)
+                    * frac
+                )
+
+        final_returns, final_horizon, final_success = eval_policy_metaworld(
+            agent,
+            env_name,
+            eval_episodes=10,
+            device=device,
+            max_episode_steps=args.max_episode_steps,
+            seed=args.seed + 9999 + task_idx,
+        )
+        final_mean_return = float(np.mean(final_returns))
+        final_mean_horizon = float(np.mean(final_horizon))
+        writer.add_scalar("charts/Eval", final_mean_return, life_step)
+        writer.add_scalar("charts/Eval_Horizon", final_mean_horizon, life_step)
+        writer.add_scalar("charts/SuccessRate", final_success, life_step)
+
+        os.makedirs("results/metaworld_cchain_crl", exist_ok=True)
+        save_path = os.path.join(
+            "results/metaworld_cchain_crl",
+            f"{env_name.replace('/', '_')}_s{args.seed}_task{task_idx}.npz",
+        )
+        np.savez_compressed(
+            save_path,
+            success_rate=final_success,
+            mean_return=final_mean_return,
+            mean_horizon=final_mean_horizon,
+            config=vars(args),
+            task_index=task_idx,
+        )
+
+        envs.close()
+
+    writer.close()
