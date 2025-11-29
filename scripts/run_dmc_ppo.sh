@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run only C-CHAIN PPO on DMC continual tasks.
+# Run vanilla PPO (no C-CHAIN) on DMC continual tasks (shared agent across task sequence).
 #
 # Usage:
-#   TOTAL_STEPS=1000000 GPU_NO=0 bash scripts/run_dmc_all.sh
+#   TOTAL_STEPS=1000000 GPU_NO=0 bash scripts/run_dmc_ppo.sh
 #
 # Env vars:
 #   TOTAL_STEPS  - total timesteps per run (default: 1_000_000)
@@ -21,8 +21,8 @@ SEEDS=(1 2 3 4 5)
 
 for env_id in "${ENV_IDS[@]}"; do
   for seed in "${SEEDS[@]}"; do
-    echo "=== C-CHAIN PPO | env_id=${env_id} | seed=${seed} | total_steps=${TOTAL_STEPS} ==="
-    uv run python crl_dmc/crl_run_ppo_c_chain_dmc.py \
+    echo "=== Vanilla PPO | env_id=${env_id} | seed=${seed} | total_steps=${TOTAL_STEPS} ==="
+    uv run python crl_dmc/crl_run_ppo_dmc.py \
       --env_id "${env_id}" \
       --seed "${seed}" \
       --total_timesteps "${TOTAL_STEPS}" \
