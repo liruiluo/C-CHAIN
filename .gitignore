@@ -16,3 +16,4 @@ results/
 videos/
 wandb/
 research/
+*.out
