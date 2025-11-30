@@ -14,7 +14,7 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 import copy
-from utils.basic_utils import make_env, AgentReLU, eval_policy
+from utils.basic_utils import make_env, AgentReLU, eval_policy, get_obs_rms_from_wrapper
 
 
 @dataclass
@@ -221,14 +221,15 @@ if __name__ == "__main__":
             # Evaluate episode
             if (global_step // args.eval_freq_timesteps) > eval_cnt:
                 eval_cnt += 1
-                norm_stats = [copy.deepcopy(e.obs_rms) for e in envs.envs]
+                norm_stats = []
+                for e in envs.envs:
+                    obs_rms = get_obs_rms_from_wrapper(getattr(e, "env", None))
+                    norm_stats.append(copy.deepcopy(obs_rms) if obs_rms is not None else None)
                 cur_eval, cur_horizon = eval_policy(agent, eval_envs, norm_stats, eval_episodes=10, device=device)
                 print("---------------------------------------")
                 print(f"T: {global_step}, life_step={life_step}, Evaluation over {len(cur_eval)} episodes. "
                       f"Scores: {np.mean(cur_eval):.3f}, Horizons: {np.mean(cur_horizon):.3f}")
                 print("---------------------------------------")
-                # evaluations.append(np.mean(cur_eval))
-                # horizons.append(np.mean(cur_horizon))
                 writer.add_scalar("charts/Eval", np.mean(cur_eval), eval_cnt)
                 writer.add_scalar("charts/Eval_Horizon", np.mean(cur_horizon), eval_cnt)
 
